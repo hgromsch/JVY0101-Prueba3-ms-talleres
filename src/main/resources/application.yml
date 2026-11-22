@@ -17,8 +17,12 @@ spring:
     username: ${DB_USERNAME:respirar}
     password: ${DB_PASSWORD:respirar}
     hikari:
-      # Pool chico: con varias réplicas por servicio, todas comparten la misma instancia RDS
+      # Pool elástico: todas las réplicas comparten la misma instancia RDS (max_connections = 81 en
+      # db.t3.micro). En reposo cada réplica mantiene 1 conexión y crece hasta 4 con carga, así caben
+      # el escalado y los rolling updates start-first (réplicas nuevas y viejas conviven un momento).
       maximum-pool-size: ${DB_POOL_SIZE:4}
+      minimum-idle: ${DB_POOL_MIN:1}
+      idle-timeout: ${DB_POOL_IDLE_MS:60000}
   data:
     redis:
       host: ${REDIS_HOST:localhost}
