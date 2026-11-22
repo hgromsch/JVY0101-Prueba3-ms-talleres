@@ -113,7 +113,11 @@ public class TallerService {
         return inscripcionRepository.findByTallerId(tallerId);
     }
 
-    /** Cancela la inscripción; si estaba confirmada, devuelve el cupo al taller. */
+    /**
+     * Cancela la inscripción. Si estaba confirmada, el cupo liberado pasa a la primera
+     * persona de la lista de espera (corrección EP3: antes la lista de espera nunca avanzaba);
+     * si no hay nadie esperando, el cupo vuelve al taller.
+     */
     public void cancelarInscripcion(UUID tallerId, UUID inscripcionId) {
         Taller taller = obtener(tallerId);
         Inscripcion inscripcion = inscripcionRepository.findById(inscripcionId)
@@ -125,13 +129,25 @@ public class TallerService {
             throw new ReglaNegocioException("La inscripción ya está cancelada");
         }
 
-        if (inscripcion.getEstado() == EstadoInscripcion.CONFIRMADA) {
-            taller.setCupoDisponible(taller.getCupoDisponible() + 1);
-            tallerRepository.save(taller);
-            redisTemplate.opsForValue().increment(claveCupo(tallerId));
-        }
+        boolean liberaCupo = inscripcion.getEstado() == EstadoInscripcion.CONFIRMADA;
         inscripcion.setEstado(EstadoInscripcion.CANCELADA);
         inscripcionRepository.save(inscripcion);
+
+        if (liberaCupo) {
+            inscripcionRepository
+                    .findFirstByTallerIdAndEstadoOrderByFechaInscripcionAsc(tallerId, EstadoInscripcion.EN_ESPERA)
+                    .ifPresentOrElse(
+                            // El cupo pasa directo a quien esperaba: el contador no cambia
+                            enEspera -> {
+                                enEspera.setEstado(EstadoInscripcion.CONFIRMADA);
+                                inscripcionRepository.save(enEspera);
+                            },
+                            () -> {
+                                taller.setCupoDisponible(taller.getCupoDisponible() + 1);
+                                tallerRepository.save(taller);
+                                redisTemplate.opsForValue().increment(claveCupo(tallerId));
+                            });
+        }
     }
 
     /** Crea la clave de cupo en Redis la primera vez, tomando el valor desde la base de datos. */

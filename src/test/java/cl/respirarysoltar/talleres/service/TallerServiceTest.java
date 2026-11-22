@@ -23,6 +23,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -73,5 +75,46 @@ class TallerServiceTest {
         Inscripcion inscripcion = service.inscribir(tallerId, new InscripcionRequest(UUID.randomUUID()));
 
         assertEquals(EstadoInscripcion.EN_ESPERA, inscripcion.getEstado());
+    }
+
+    @Test
+    void cancelarUnaConfirmadaPromueveAlPrimeroDeLaListaDeEspera() {
+        Inscripcion confirmada = new Inscripcion(UUID.randomUUID(), EstadoInscripcion.CONFIRMADA);
+        confirmada.setTaller(taller);
+        Inscripcion enEspera = new Inscripcion(UUID.randomUUID(), EstadoInscripcion.EN_ESPERA);
+        UUID inscripcionId = UUID.randomUUID();
+        when(tallerRepository.findById(tallerId)).thenReturn(Optional.of(conId(taller, tallerId)));
+        when(inscripcionRepository.findById(inscripcionId)).thenReturn(Optional.of(confirmada));
+        when(inscripcionRepository.findFirstByTallerIdAndEstadoOrderByFechaInscripcionAsc(tallerId, EstadoInscripcion.EN_ESPERA))
+                .thenReturn(Optional.of(enEspera));
+
+        service.cancelarInscripcion(tallerId, inscripcionId);
+
+        assertEquals(EstadoInscripcion.CANCELADA, confirmada.getEstado());
+        assertEquals(EstadoInscripcion.CONFIRMADA, enEspera.getEstado());
+        verify(valueOperations, never()).increment(anyString());
+    }
+
+    @Test
+    void cancelarUnaConfirmadaSinListaDeEsperaDevuelveElCupo() {
+        Inscripcion confirmada = new Inscripcion(UUID.randomUUID(), EstadoInscripcion.CONFIRMADA);
+        confirmada.setTaller(taller);
+        UUID inscripcionId = UUID.randomUUID();
+        int cupoAntes = taller.getCupoDisponible();
+        when(tallerRepository.findById(tallerId)).thenReturn(Optional.of(conId(taller, tallerId)));
+        when(inscripcionRepository.findById(inscripcionId)).thenReturn(Optional.of(confirmada));
+        when(inscripcionRepository.findFirstByTallerIdAndEstadoOrderByFechaInscripcionAsc(tallerId, EstadoInscripcion.EN_ESPERA))
+                .thenReturn(Optional.empty());
+
+        service.cancelarInscripcion(tallerId, inscripcionId);
+
+        assertEquals(cupoAntes + 1, taller.getCupoDisponible());
+        verify(valueOperations).increment(anyString());
+    }
+
+    /** El taller de prueba no pasa por JPA: se le asigna el id por reflexión. */
+    private static Taller conId(Taller taller, UUID id) {
+        org.springframework.test.util.ReflectionTestUtils.setField(taller, "id", id);
+        return taller;
     }
 }
