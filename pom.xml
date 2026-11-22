@@ -13,7 +13,7 @@
 
     <groupId>cl.respirarysoltar</groupId>
     <artifactId>ms-talleres</artifactId>
-    <version>0.1.0</version>
+    <version>0.3.0</version>
     <name>ms-talleres</name>
     <description>Publicación de talleres grupales e inscripciones con control de cupo. Cubre RF-06 y RF-07. Es el servicio con el perfil de carga más alto en picos (apertura de inscripciones).</description>
 
@@ -27,6 +27,11 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <!-- Salud del contenedor: /actuator/health/liveness y /readiness (HEALTHCHECK de Docker y Swarm) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
