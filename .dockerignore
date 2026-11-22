@@ -1,0 +1,13 @@
+# Contexto de build mínimo: solo pom.xml y src/ llegan al daemon de Docker
+target/
+.git/
+.github/
+.idea/
+.vscode/
+*.iml
+*.md
+*.log
+.env
+.DS_Store
+Dockerfile
+.dockerignore

@@ -1,0 +1,166 @@
+# Pipeline CI/CD de ms-talleres (EP3, IE4/IE5/IE6)
+#   1. build-test   → compila y ejecuta las pruebas con Maven (en cada push y pull request)
+#   2. provision    → asegura los recursos cloud del servicio (repositorio ECR)
+#   3. imagen       → construye la imagen Docker multi-stage y la sube a Amazon ECR (sha + latest)
+#   4. desplegar    → rolling update del servicio rys_ms-talleres en el clúster Docker Swarm (SSH al manager)
+#   5. verificar    → prueba de humo a través del API Gateway: salud + versión desplegada = commit
+# Las etapas 2-5 corren solo en push a main. Secrets: ver README (sección CI/CD).
+name: CI/CD ms-talleres
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore: ["**.md"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: despliegue-ms-talleres-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SERVICIO: ms-talleres
+  RUTA_API: talleres
+  ECR_REPOSITORIO: rys/ms-talleres
+  AWS_REGION: us-east-1
+
+jobs:
+  build-test:
+    name: 1 · Build y pruebas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: mvn verify (compila, prueba y empaqueta)
+        run: mvn -B -ntp verify
+      - name: Resumen de pruebas
+        if: always()
+        run: |
+          echo "### Pruebas de ms-talleres" >> "$GITHUB_STEP_SUMMARY"
+          grep -h "Tests run" target/surefire-reports/*.txt | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reportes-pruebas
+          path: target/surefire-reports/
+          retention-days: 14
+
+  provision:
+    name: 2 · Recursos cloud del servicio
+    needs: build-test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Repositorio ECR (se crea si no existe, con análisis de vulnerabilidades)
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORIO" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "$ECR_REPOSITORIO" \
+              --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORIO" \
+            --query 'repositories[0].[repositoryUri,imageScanningConfiguration.scanOnPush]' --output text
+
+  imagen:
+    name: 3 · Imagen Docker → Amazon ECR
+    needs: provision
+    runs-on: ubuntu-latest
+    outputs:
+      imagen: ${{ steps.etiqueta.outputs.imagen }}
+      version: ${{ steps.etiqueta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: etiqueta
+        run: |
+          VERSION="${GITHUB_SHA::7}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "imagen=${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORIO:$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: docker build + push (multi-stage, caché de capas)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          build-args: APP_VERSION=${{ steps.etiqueta.outputs.version }}
+          tags: |
+            ${{ steps.etiqueta.outputs.imagen }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORIO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Análisis de vulnerabilidades de ECR
+        continue-on-error: true
+        run: |
+          aws ecr wait image-scan-complete --repository-name "$ECR_REPOSITORIO" --image-id imageTag=${{ steps.etiqueta.outputs.version }}
+          echo "### Vulnerabilidades de la imagen" >> "$GITHUB_STEP_SUMMARY"
+          aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORIO" \
+            --image-id imageTag=${{ steps.etiqueta.outputs.version }} \
+            --query 'imageScanFindings.findingSeverityCounts' --output json | tee -a "$GITHUB_STEP_SUMMARY"
+
+  desplegar:
+    name: 4 · Despliegue en Docker Swarm
+    needs: imagen
+    runs-on: ubuntu-latest
+    environment: produccion
+    steps:
+      - name: Llave SSH del clúster
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SWARM_SSH_KEY }}" > ~/.ssh/swarm.pem
+          chmod 600 ~/.ssh/swarm.pem
+          ssh-keyscan -H "${{ secrets.SWARM_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: docker service update (rolling update start-first con rollback automático)
+        env:
+          IMAGEN: ${{ needs.imagen.outputs.imagen }}
+        run: |
+          ssh -i ~/.ssh/swarm.pem ec2-user@${{ secrets.SWARM_HOST }} bash -s <<EOF
+          set -e
+          aws ecr get-login-password --region $AWS_REGION | docker login -u AWS --password-stdin ${IMAGEN%%/*} >/dev/null
+          docker service update --with-registry-auth --detach=false --image $IMAGEN rys_$SERVICIO
+          docker service ps rys_$SERVICIO --filter desired-state=running --format 'table {{.Name}}\t{{.Image}}\t{{.Node}}\t{{.CurrentState}}'
+          EOF
+
+  verificar:
+    name: 5 · Prueba de humo vía API Gateway
+    needs: [imagen, desplegar]
+    runs-on: ubuntu-latest
+    steps:
+      - name: La versión desplegada responde por el API Gateway
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+          VERSION: ${{ needs.imagen.outputs.version }}
+        run: |
+          for i in $(seq 1 30); do
+            INFO=$(curl -s -H "x-api-key: $API_KEY" "$API_URL/$RUTA_API/actuator/info" || true)
+            echo "$INFO" | grep -q "\"version\":\"$VERSION\"" && break
+            sleep 5
+          done
+          echo "$INFO"
+          echo "$INFO" | grep -q "\"version\":\"$VERSION\"" || { echo "La versión $VERSION no quedó activa"; exit 1; }
+          curl -fsS -H "x-api-key: $API_KEY" "$API_URL/$RUTA_API/actuator/health"; echo
+          CODIGO=$(curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: $API_KEY" "$API_URL/$RUTA_API/api/talleres")
+          echo "GET /talleres/api/talleres → $CODIGO"; test "$CODIGO" = 200
+          SIN_KEY=$(curl -s -o /dev/null -w '%{http_code}' "$API_URL/$RUTA_API/api/talleres")
+          echo "Sin API key → $SIN_KEY (esperado 403)"; test "$SIN_KEY" = 403
+          echo "✅ ms-talleres $VERSION desplegado y accesible en $API_URL/$RUTA_API" >> "$GITHUB_STEP_SUMMARY"
